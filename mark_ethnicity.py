@@ -22,7 +22,9 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Sequence
+
+from feedback_store import FeedbackEntry, FeedbackStore
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -55,6 +57,17 @@ def build_ssl_context() -> ssl.SSLContext:
     if bundle_path and Path(bundle_path).exists():
         return ssl.create_default_context(cafile=bundle_path)
     return ssl.create_default_context()
+
+
+def build_prompt(base_prompt: str, examples: Sequence[FeedbackEntry]) -> str:
+    if not examples:
+        return base_prompt
+
+    lines = [base_prompt, "", "Previously approved mappings:"]
+    for entry in examples:
+        note_segment = f" ({entry.notes})" if entry.notes else ""
+        lines.append(f"- {entry.name} -> {entry.ethnicity}{note_segment}")
+    return "\n".join(lines)
 
 
 def call_openai(name: str, prompt: str, model: str, context: ssl.SSLContext) -> str:
@@ -121,6 +134,9 @@ def process_rows(
     model: str,
     limit: int | None,
     has_header: bool,
+    store: FeedbackStore,
+    fewshot_count: int,
+    force_api: bool,
 ) -> List[List[str]]:
     context = build_ssl_context()
     start_index = 1 if (has_header and rows) else 0
@@ -142,7 +158,12 @@ def process_rows(
         if not name:
             label = "Unknown"
         else:
-            label = call_openai(name, prompt, model, context)
+            cached = None if force_api else store.lookup(name)
+            if cached:
+                label = cached.ethnicity
+            else:
+                examples = store.similar_examples(name, fewshot_count) or store.sample(fewshot_count)
+                label = call_openai(name, build_prompt(prompt, examples), model, context)
 
         output_rows.append(insert_ethnicity(row, label))
         processed += 1
@@ -187,6 +208,23 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="Override the OpenAI model (defaults to environment or gpt-4o-mini).",
     )
+    parser.add_argument(
+        "--feedback-store",
+        type=str,
+        default=str(REPO_ROOT / "feedback.csv"),
+        help="CSV file containing verified name→ethnicity mappings.",
+    )
+    parser.add_argument(
+        "--fewshot-count",
+        type=int,
+        default=5,
+        help="How many feedback examples to include as guidance in the prompt.",
+    )
+    parser.add_argument(
+        "--force-api",
+        action="store_true",
+        help="Always call OpenAI even if the feedback store contains a label for the name.",
+    )
     return parser.parse_args()
 
 
@@ -221,6 +259,7 @@ def main() -> int:
         return 1
 
     output_path = derive_output_path(input_path, args.output_csv)
+    feedback_store = FeedbackStore(Path(args.feedback_store).expanduser())
 
     try:
         annotated = process_rows(
@@ -229,6 +268,9 @@ def main() -> int:
             model=model,
             limit=args.limit,
             has_header=not args.no_header,
+            store=feedback_store,
+            fewshot_count=max(0, args.fewshot_count),
+            force_api=args.force_api,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"Failed to classify names: {exc}", file=sys.stderr)
